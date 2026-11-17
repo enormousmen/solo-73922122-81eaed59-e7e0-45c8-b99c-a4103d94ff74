@@ -23,6 +23,7 @@ services:
       # global defaults for the test hooks (per-request overrides exist):
       # CANCEL_SEND_DELAY_MS: "0"
       # CLEANUP_DELAY_MS: "0"
+      # STATEMENT_GAP_DELAY_MS: "0"
     depends_on:
       db:
         condition: service_healthy

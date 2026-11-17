@@ -15,6 +15,16 @@ class SubmitOptions(BaseModel):
         "session cleanup (simulates slow cleanup). Defaults to the "
         "server-wide CLEANUP_DELAY_MS.",
     )
+    statement_gap_delay_ms: int | None = Field(
+        default=None,
+        ge=0,
+        le=config.MAX_HOOK_DELAY_MS,
+        description="Test hook: pause this many ms between consecutive "
+        "statements (reproduces the statement hand-off window in which a "
+        "cancel can be accepted while the connection is idle between two "
+        "statements). The pause is abortable by cancel. Defaults to the "
+        "server-wide STATEMENT_GAP_DELAY_MS.",
+    )
     break_connection_after: bool = Field(
         default=False,
         description="Test hook: close this job's connection right after the "
@@ -72,6 +82,7 @@ class JobDetail(BaseModel):
     cancel_requested: bool
     cancel_accepted_at: str | None
     statements: list[StatementResult]
+    statement_gap_delay_ms: int | None = None
 
 
 class JobSummary(BaseModel):

@@ -89,6 +89,7 @@ def submit_job(req: SubmitRequest):
         statements,
         cleanup_delay_ms=req.options.cleanup_delay_ms,
         break_connection_after=req.options.break_connection_after,
+        statement_gap_delay_ms=req.options.statement_gap_delay_ms,
     )
     if not pool.submit(job):
         raise HTTPException(

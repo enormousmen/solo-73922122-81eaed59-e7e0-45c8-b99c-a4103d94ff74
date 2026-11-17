@@ -26,8 +26,12 @@ JOB_HISTORY: int = int(os.environ.get("JOB_HISTORY", "1000"))
 #   cancel immediately).
 # CLEANUP_DELAY_MS: pause inside the session-cleanup phase (simulates slow
 #   cleanup; the other connection is unaffected).
+# STATEMENT_GAP_DELAY_MS: pause between consecutive statements (simulates the
+#   hand-off window where the connection is idle between two statements, so
+#   the statement-boundary cancel race can be reproduced deterministically).
 CANCEL_SEND_DELAY_MS: int = int(os.environ.get("CANCEL_SEND_DELAY_MS", "0"))
 CLEANUP_DELAY_MS: int = int(os.environ.get("CLEANUP_DELAY_MS", "0"))
+STATEMENT_GAP_DELAY_MS: int = int(os.environ.get("STATEMENT_GAP_DELAY_MS", "0"))
 
 # Upper bound for the per-request delay hooks above.
 MAX_HOOK_DELAY_MS: int = int(os.environ.get("MAX_HOOK_DELAY_MS", "120000"))

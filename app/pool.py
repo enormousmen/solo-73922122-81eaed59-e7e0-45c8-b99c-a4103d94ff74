@@ -269,11 +269,42 @@ class _Worker(threading.Thread):
     def _execute_statements(self, job: Job) -> None:
         conn = self.cinfo.conn
         assert conn is not None
+        gap_ms = (
+            job.statement_gap_delay_ms
+            if job.statement_gap_delay_ms is not None
+            else config.STATEMENT_GAP_DELAY_MS
+        )
         for rec in job.records:
             idx = rec["index"]
-            if job.cancel_requested.is_set():
+            if idx > 0 and gap_ms:
+                # Test hook: widen the statement hand-off window in which the
+                # connection is idle between two statements. The pause is
+                # abortable (woken as soon as a cancel lands) and sliced so a
+                # delayed cancel sender can still be observed running while
+                # the worker demonstrably remains in this gap.
+                deadline = time.monotonic() + gap_ms / 1000.0
+                while time.monotonic() < deadline:
+                    if job.cancel_requested.wait(timeout=0.05):
+                        job.skip_from(idx)
+                        job.finish(
+                            "cancelled",
+                            "cancel accepted before statement started; "
+                            "statement never sent",
+                        )
+                        return
+            # Atomic claim gate: re-check the cancel flag together with
+            # marking the statement in flight under handoff_lock. A cancel
+            # accepted before this statement actually starts makes the claim
+            # fail, so the statement is never sent; once the claim succeeds
+            # any (concurrent) cancel sender is guaranteed to see an in-flight
+            # statement and interrupt it.
+            if not job.claim_next_statement(idx):
                 job.skip_from(idx)
-                job.finish("cancelled", "cancel accepted; remaining statements skipped")
+                job.finish(
+                    "cancelled",
+                    "cancel accepted before statement started; "
+                    "statement never sent",
+                )
                 return
             job.stmt_running(idx)
             t0 = time.monotonic()
@@ -306,6 +337,23 @@ class _Worker(threading.Thread):
                 job.stmt_error(idx, _err_text(exc), _elapsed_ms(t0))
                 job.skip_from(idx + 1)
                 job.finish("failed", _err_text(exc))
+                return
+            finally:
+                # Statement is no longer in flight: the backend is idle until
+                # the next claim gate. Cleared before the next loop iteration,
+                # under the same handoff_lock used by the cancel sender.
+                job.clear_statement_in_flight()
+            # A cancel accepted while execute() was already in progress may
+            # arrive too late to interrupt it (or signals may be unavailable);
+            # the statement then completes naturally. Do not start any further
+            # statement and report the terminal state truthfully.
+            if job.cancel_requested.is_set():
+                job.skip_from(idx + 1)
+                job.finish(
+                    "cancelled",
+                    "cancel accepted while statement ran; statement completed "
+                    "before it could be interrupted, remaining statements skipped",
+                )
                 return
         job.finish("succeeded")
 
@@ -392,8 +440,9 @@ class _CancelSender(threading.Thread):
             return
         cinfo = self.pool.connections[conn_id]
         with cinfo.lock:
-            # Guard against the late-cancel race: only transmit while this
-            # job is still the connection's current, non-terminal job.
+            # First guard against the late-cancel race at connection level:
+            # only act while this job is still the connection's current,
+            # non-terminal job, so a late cancel can never hit the next job.
             if cinfo.current_job_id != job_id or job.is_terminal():
                 log.info(
                     "cancel for job %s not sent: job no longer current "
@@ -401,7 +450,17 @@ class _CancelSender(threading.Thread):
                     job_id,
                 )
                 return
-            if cinfo.conn is None:
-                return
-            log.info("sending cancel for job %s on connection %d", job_id, conn_id)
-            cinfo.conn.cancel()
+            conn = cinfo.conn
+        # Second guard at statement level: send the cancel only while a
+        # statement is actually in flight. If the worker is idle between
+        # statements, conn.cancel() would be discarded by PostgreSQL before
+        # the next statement starts; skip the send entirely and let the
+        # worker's claim gate prevent that statement from running.
+        if job.send_cancel_if_in_flight(conn):
+            log.info("sent cancel for job %s on connection %d", job_id, conn_id)
+        else:
+            log.info(
+                "cancel for job %s not transmitted: connection idle between "
+                "statements; worker will not start the next statement",
+                job_id,
+            )

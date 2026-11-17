@@ -67,6 +67,35 @@ echo "-- a job on the OTHER connection finished meanwhile:"
 curl -s "$BASE/jobs/$JOB2" | pp
 
 echo
+echo "=== 4b) statement hand-off race: cancel in the inter-statement gap ==="
+echo "-- 4s gap hook between statements; cancel after S1 finishes, before S2 starts"
+JOB=$(curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{
+  "statements": ["SELECT 1 AS s1", "CREATE TABLE public.demo_gap_xyz (id int)"],
+  "options": {"statement_gap_delay_ms": 4000}}' | jid)
+# poll until S1 is ok, then cancel while the worker idles in the gap
+python3 - "$BASE" "$JOB" <<'PY'
+import json, sys, time, urllib.request
+base, jid = sys.argv[1], sys.argv[2]
+def call(m, p, b=None):
+    d = json.dumps(b).encode() if b is not None else None
+    r = urllib.request.Request(base + p, data=d, method=m,
+                               headers={"content-type": "application/json"})
+    with urllib.request.urlopen(r, timeout=30) as x:
+        return json.loads(x.read())
+deadline = time.monotonic() + 10
+while call("GET", f"/jobs/{jid}")["statements"][0]["status"] != "ok":
+    time.sleep(0.05)
+print("S1 ok; cancelling while the connection is idle in the gap...")
+print(json.dumps(call("POST", f"/jobs/{jid}/cancel", {"delay_ms": 500}), indent=2))
+PY
+sleep 2
+echo "-- S2 must be skipped (never sent), job cancelled, no table created:"
+curl -s "$BASE/jobs/$JOB" | pp
+curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{
+  "statements": ["SELECT to_regclass('"'"'public.demo_gap_xyz'"'"') AS table_exists"]}' \
+  | jid | while read j; do sleep 1; curl -s "$BASE/jobs/$j" | pp; done
+
+echo
 echo "=== 5) late cancel after natural finish is a no-op (409) ==="
 JOB=$(curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{"statements": ["SELECT 1"]}' | jid)
 sleep 1

@@ -11,9 +11,10 @@ PostgreSQL 连接**之一上按序自动提交执行；支持逐句结果查询�
   POST /jobs ──▶│  校验(sqlguard) → JobStore(内存注册表) → 共享队列       │
   GET  /jobs/*  │                                                        │
   POST ../cancel│  cancel: 置标志 + 202 即时受理 ──▶ CancelSender 线程    │
-  GET  /pool    │       (可配置发送停顿) ──▶ conn.cancel()               │
-                │                                                        │
+  GET  /pool    │       (可配置发送停顿) ──▶ 仅语句 in-flight 时          │
+                │                              conn.cancel()             │
                 │  Worker 线程 #1 ── 连接 #1 (autocommit, 长连接)         │
+                │    每句: 原子受理闸门(handoff_lock) → execute → 收尾    │
                 │  Worker 线程 #2 ── 连接 #2 (autocommit, 长连接)         │
                 └────────────────────────┬───────────────────────────────┘
                                          ▼
@@ -66,7 +67,7 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diag \
 ```bash
 curl -XPOST localhost:8000/jobs -H 'content-type: application/json' -d '{
   "statements": ["SET work_mem = '"'"'64MB'"'"'", "SELECT count(*) FROM pg_stat_activity"],
-  "options": {"cleanup_delay_ms": 0, "break_connection_after": false}
+  "options": {"cleanup_delay_ms": 0, "statement_gap_delay_ms": 0, "break_connection_after": false}
 }'
 ```
 
@@ -81,14 +82,24 @@ curl -XPOST localhost:8000/jobs -H 'content-type: application/json' -d '{
 
 - **及时受理**：`POST /jobs/{id}/cancel` 立即置标志并返回 202；真正的取消发送
   由独立线程完成（可用 `{"delay_ms": N}` 模拟慢取消管道），不阻塞受理。
-- **受理后**：正在执行的语句被 `conn.cancel()` 中断（PostgreSQL 标准取消），
-  后续语句全部 `skipped`；**此前已提交的语句效果保留**（自动提交，无回滚）。
-  极端时序下已发往服务器的语句可能自然完成，属正常现象。
+- **语句交接（消除竞态）**：每条语句在真正发往 PostgreSQL 之前都经过一道
+  **原子受理闸门**（`handoff_lock` 内同时复查取消标志并把该句标记为 in-flight）：
+  - 取消在**下一句实际开始前**被受理（含上一句刚结束、连接处于句间空闲的窗口）
+    → 该句**绝不发送**，本单记 `cancelled`，余句全部 `skipped`；
+  - 取消在语句**已开始后**才受理 → 取消发送线程只在语句确实 in-flight 时调用
+    `conn.cancel()`，尽快中断该句（`QueryCanceled` 记 `cancelled`）；若极端时序下
+    信号到达时语句已自然完成，则该句保留 `ok`，但余句仍全部 `skipped`，终态据实
+    记为 `cancelled`。
+- **受理后**：后续语句全部 `skipped`；**此前已提交的语句效果保留**（自动提交，
+  无回滚）。
 - **排队中的单**：直接标记 `cancelled`，不会执行。
-- **迟到取消**：单已结束时取消返回 409（无操作）；发送线程在发送前按连接校验
-  "该单仍是此连接当前单且未结束"，因此**迟到的取消绝不会误停同一连接上的下一单**。
+- **迟到取消**：单已结束时取消返回 409（无操作）；发送线程有两道校验——先按连接
+  校验"该单仍是此连接当前单且未结束"，再按语句校验"确有语句 in-flight"才发送，
+  因此**迟到的取消绝不会误停同一连接上的下一单**；连接在句间空闲时收到的取消会被
+  直接抑制（PostgreSQL 会丢弃空闲期的取消信号，发了也不会作用于下一句）。
 - **连接归还条件**：SQL 停止 + 取消发送完成 + 会话清理完成，三者齐备后连接才
-  回到空闲（可用延迟钩子直接观测）。
+  回到空闲（可用延迟钩子直接观测）。慢取消发送只占用发送线程与该连接的 worker，
+  不影响另一连接的执行和任何状态查询。
 
 ### 会话清理（每单结束后，成功/失败/取消都执行）
 
@@ -102,15 +113,17 @@ curl -XPOST localhost:8000/jobs -H 'content-type: application/json' -d '{
 | 钩子 | 位置 | 作用 |
 |---|---|---|
 | `options.cleanup_delay_ms` | 提交单时 | 清理阶段停顿 N 毫秒（模拟慢清理） |
+| `options.statement_gap_delay_ms` | 提交单时 | 句间停顿 N 毫秒，**可复现语句交接竞态**（取消在句间空闲窗口受理）；停顿可被取消立即中断 |
 | `{"delay_ms": N}` | 取消请求体 | 受理后延迟 N 毫秒再向 PG 发送取消（模拟慢取消发送） |
 | `options.break_connection_after` | 提交单时 | 单结束后断开本连接（模拟连接故障），触发淘汰+补建 |
-| `CANCEL_SEND_DELAY_MS` / `CLEANUP_DELAY_MS` | 环境变量 | 上述两个延迟的全局默认值 |
+| `CANCEL_SEND_DELAY_MS` / `CLEANUP_DELAY_MS` / `STATEMENT_GAP_DELAY_MS` | 环境变量 | 上述三个延迟的全局默认值 |
 
 ## 自测
 
 ```bash
 pip install -r requirements-dev.txt
-pytest tests/test_sqlguard.py        # 纯单元测试（SQL 守卫），无需数据库
+pytest tests/test_sqlguard.py         # SQL 守卫单元测试（无需数据库）
+pytest tests/test_handoff_race.py     # 语句交接/取消竞态确定性测试（伪连接，无需数据库）
 # 集成测试需要运行中的服务与数据库：
 API_BASE=http://localhost:8000 TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diag \
   pytest tests/test_integration.py
@@ -118,6 +131,7 @@ API_BASE=http://localhost:8000 TEST_DATABASE_URL=postgresql://postgres:postgres@
 
 集成测试覆盖：按序自动提交与逐句结果、行数截断、失败即停、参数校验、
 会话状态不泄漏（SET/临时表/咨询锁/预备语句，含失败单）、取消运行中/排队中的单、
+**句间空闲窗口受理的取消不执行下一句（含慢发送时序）**、
 迟到取消（409 与延迟发送不误伤下一单）、慢 SQL/慢清理不阻塞另一连接、
 清理失败淘汰并补建连接（钩子注入 + `pg_terminate_backend` 真实杀连接两种）。
 

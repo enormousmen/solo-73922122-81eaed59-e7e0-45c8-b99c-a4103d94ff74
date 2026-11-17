@@ -42,13 +42,16 @@ def client():
 
 # ---------------------------------------------------------------- helpers
 
-def submit(client, statements, cleanup_delay_ms=None, break_connection_after=False):
+def submit(client, statements, cleanup_delay_ms=None, break_connection_after=False,
+           statement_gap_delay_ms=None):
     body = {"statements": statements}
     options = {}
     if cleanup_delay_ms is not None:
         options["cleanup_delay_ms"] = cleanup_delay_ms
     if break_connection_after:
         options["break_connection_after"] = True
+    if statement_gap_delay_ms is not None:
+        options["statement_gap_delay_ms"] = statement_gap_delay_ms
     if options:
         body["options"] = options
     r = client.post("/jobs", json=body)
@@ -293,6 +296,94 @@ class TestCancel:
             wait_pool_idle(client)
             wait_job(client, submit(client, ["DROP TABLE IF EXISTS public.cancel_keep"]))
 
+    def test_cancel_accepted_in_statement_gap_skips_next_statement(self, client):
+        """The statement-boundary race: the first statement has finished and
+        the connection is idle in the (hook-widened) inter-statement gap
+        when the cancel is accepted. The next statement must never be sent
+        to PostgreSQL and the job must end as cancelled, not succeeded."""
+        job_id = submit(
+            client,
+            [
+                "CREATE TABLE IF NOT EXISTS public.gap_keep (id int)",
+                "INSERT INTO public.gap_keep VALUES (1)",
+                "CREATE TABLE public.gap_must_not_exist_xyz (id int)",
+                "SELECT 'never runs' AS x",
+            ],
+            statement_gap_delay_ms=3000,
+        )
+        # wait for statement 2 to finish; the worker then sleeps in the gap
+        deadline = time.monotonic() + 10
+        while True:
+            j = get_job(client, job_id)
+            if j["statements"][1]["status"] == "ok":
+                break
+            assert time.monotonic() < deadline, j
+            time.sleep(0.05)
+        # cancel while the connection is idle, before statement 3 starts
+        r = cancel(client, job_id, delay_ms=300)
+        assert r.status_code == 202, r.text
+
+        job = wait_job(client, job_id, timeout=20)
+        assert job["status"] == "cancelled", job["status"]
+        stmts = job["statements"]
+        assert stmts[0]["status"] == "ok"
+        assert stmts[1]["status"] == "ok"
+        assert stmts[2]["status"] == "skipped"
+        assert stmts[3]["status"] == "skipped"
+        # committed effects of earlier statements stay
+        check = wait_job(
+            client, submit(client, ["SELECT count(*) AS n FROM public.gap_keep"])
+        )
+        assert check["statements"][0]["rows"] == [[1]]
+        # the later statement really never reached the server
+        check2 = wait_job(
+            client,
+            submit(
+                client,
+                ["SELECT to_regclass('public.gap_must_not_exist_xyz') AS t"],
+            ),
+        )
+        assert check2["statements"][0]["rows"] == [[None]]
+        wait_pool_idle(client)
+        wait_job(client, submit(client, ["DROP TABLE IF EXISTS public.gap_keep"]))
+
+    def test_cancel_with_slow_send_during_gap_does_not_execute_next(self, client):
+        """Same boundary, but the cancel send itself is delayed: by the time
+        the sender runs the worker is still idle in the gap. The sender must
+        not fire an idle cancel that PostgreSQL would discard; the claim
+        gate must stop the next statement regardless."""
+        job_id = submit(
+            client,
+            [
+                "SELECT 1 AS one",
+                "CREATE TABLE public.slow_send_must_not_exist_xyz (id int)",
+            ],
+            statement_gap_delay_ms=4000,
+        )
+        deadline = time.monotonic() + 10
+        while True:
+            j = get_job(client, job_id)
+            if j["statements"][0]["status"] == "ok":
+                break
+            assert time.monotonic() < deadline, j
+            time.sleep(0.05)
+        r = cancel(client, job_id, delay_ms=1000)  # send lands inside the gap
+        assert r.status_code == 202, r.text
+
+        job = wait_job(client, job_id, timeout=20)
+        assert job["status"] == "cancelled", job["status"]
+        assert job["statements"][0]["status"] == "ok"
+        assert job["statements"][1]["status"] == "skipped"
+        check = wait_job(
+            client,
+            submit(
+                client,
+                ["SELECT to_regclass('public.slow_send_must_not_exist_xyz') AS t"],
+            ),
+        )
+        assert check["statements"][0]["rows"] == [[None]]
+        wait_pool_idle(client)
+
     def test_cancel_queued_job(self, client):
         s1, _ = occupy_one_conn(client, seconds=15)
         s2, _ = occupy_one_conn(client, seconds=15)
@@ -326,20 +417,36 @@ class TestCancel:
         assert r.status_code == 409
 
     def test_delayed_cancel_send_does_not_hit_next_job(self, client):
-        """Cancel send delayed beyond the natural end of the job: the stray
-        cancel must not stop the next job on the same connection, and the
-        connection is handed over only after the cancel send resolved."""
+        """Cancel send delayed beyond the end of the job: the stray cancel
+        must not stop the next job on the same connection, and the
+        connection is handed over only after the cancel send resolved.
+
+        The job is given a long inter-statement gap: the cancel is accepted
+        while the connection is idle in that gap, and the delayed send also
+        lands while idle. The sender must suppress the (useless) idle
+        cancel and the claim gate stops the remaining statements."""
         sleeper, busy_conn = occupy_one_conn(client, seconds=15)
         try:
-            job_a = submit(client, ["SELECT pg_sleep(1.5)"])
-            # cancel immediately, but the send is delayed 4s (test hook):
-            # the job finishes naturally long before the cancel is sent.
+            job_a = submit(
+                client,
+                ["SELECT 1 AS one", "SELECT 'never runs' AS two"],
+                statement_gap_delay_ms=4000,
+            )
+            deadline = time.monotonic() + 10
+            while True:
+                ja0 = get_job(client, job_a)
+                if ja0["statements"][0]["status"] == "ok":
+                    break
+                assert time.monotonic() < deadline, ja0
+                time.sleep(0.05)
+            # accepted while idle; the 4s-delayed send lands still inside the
+            # idle gap and must be suppressed rather than hitting the backend
             r = cancel(client, job_a, delay_ms=4000)
             assert r.status_code == 202
             ja = wait_job(client, job_a, timeout=30)
-            # all statements completed before the cancel could act
-            assert ja["status"] == "succeeded"
+            assert ja["status"] == "cancelled", ja
             assert ja["statements"][0]["status"] == "ok"
+            assert ja["statements"][1]["status"] == "skipped"
             conn_id = ja["connection_id"]
             # next job on the same connection must not be disturbed
             job_b = submit(client, ["SELECT pg_sleep(0.5)", "SELECT 2 AS two"])

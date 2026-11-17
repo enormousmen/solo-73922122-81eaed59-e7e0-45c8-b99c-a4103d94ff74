@@ -21,9 +21,16 @@ def utcnow() -> str:
 
 class Job:
     def __init__(self, statements: list[str], cleanup_delay_ms: int | None = None,
-                 break_connection_after: bool = False):
+                 break_connection_after: bool = False,
+                 statement_gap_delay_ms: int | None = None):
         self.id = uuid.uuid4().hex[:12]
         self.lock = threading.Lock()
+        # Serializes the statement hand-off: the worker takes this lock to
+        # atomically (re)check the cancel flag *and* mark a statement as
+        # in flight; the cancel sender takes it to decide whether the
+        # connection actually has an in-flight statement to interrupt.
+        # Lock order when both are needed: handoff_lock -> lock.
+        self.handoff_lock = threading.Lock()
         self.status = "queued"  # queued -> running -> succeeded|failed|cancelled
         self.created_at = utcnow()
         self.started_at: str | None = None
@@ -31,11 +38,17 @@ class Job:
         self.connection_id: int | None = None
         self.cleanup_delay_ms = cleanup_delay_ms  # test hook; None = server default
         self.break_connection_after = break_connection_after  # test hook
+        self.statement_gap_delay_ms = statement_gap_delay_ms  # test hook
         self.error: str | None = None
         # cancel plumbing
         self.cancel_requested = threading.Event()
         self.cancel_send_done = threading.Event()
         self.cancel_accepted_at: str | None = None
+        # True only between the atomic claim gate and the end of execute();
+        # guarded by handoff_lock. When False the connection is idle (between
+        # statements, in cleanup or not yet started) and conn.cancel() would
+        # have no statement to interrupt.
+        self.statement_in_flight = False
         # set when the job reaches a terminal state
         self.done = threading.Event()
         self.records = [
@@ -63,6 +76,51 @@ class Job:
             self.status = "running"
             self.started_at = utcnow()
             self.connection_id = connection_id
+            return True
+
+    # ---- statement hand-off / cancel-send protocol ------------------------
+
+    def claim_next_statement(self, idx: int) -> bool:
+        """Atomically gate the start of statement ``idx``.
+
+        Returns ``True`` and marks the statement in flight only if no cancel
+        was accepted before the statement actually starts. If a cancel was
+        accepted while the connection was still idle (e.g. in the gap after
+        the previous statement finished), returns ``False`` and the statement
+        must never be sent to PostgreSQL.
+
+        Together with :meth:`send_cancel_if_in_flight` this closes the
+        statement-boundary race: a cancel flag set and an in-flight marker
+        can never be observed as mutually exclusive in a way that both (a)
+        lets the statement start and (b) skips the cancel signal.
+        """
+        with self.handoff_lock:
+            if self.cancel_requested.is_set():
+                return False
+            self.statement_in_flight = True
+            return True
+
+    def clear_statement_in_flight(self) -> None:
+        with self.handoff_lock:
+            self.statement_in_flight = False
+
+    def send_cancel_if_in_flight(self, conn) -> bool:
+        """Transmit ``conn.cancel()`` iff a statement is currently in flight.
+
+        Returns ``True`` when the cancel was sent, ``False`` when the
+        connection was idle between statements (or the job had ended): in
+        that case nothing is transmitted -- a cancel delivered while the
+        backend is idle would be discarded by PostgreSQL before the next
+        statement runs -- and the worker's claim gate stops the next
+        statement instead. A late cancel can therefore never disturb the
+        next job on the same connection.
+        """
+        with self.handoff_lock:
+            with self.lock:
+                terminal = self.status in TERMINAL_STATES
+            if terminal or not self.statement_in_flight or conn is None:
+                return False
+            conn.cancel()
             return True
 
     def stmt_running(self, idx: int) -> None:
@@ -127,6 +185,7 @@ class Job:
                 "finished_at": self.finished_at,
                 "connection_id": self.connection_id,
                 "cleanup_delay_ms": self.cleanup_delay_ms,
+                "statement_gap_delay_ms": self.statement_gap_delay_ms,
                 "error": self.error,
                 "cancel_requested": self.cancel_requested.is_set(),
                 "cancel_accepted_at": self.cancel_accepted_at,
